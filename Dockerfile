@@ -17,7 +17,7 @@ COPY requirements_production.txt .
 RUN pip install --no-cache-dir -r requirements_production.txt
 
 # Copy application code
-COPY server_unified.py .
+COPY server_production.py .
 
 # Expose port
 EXPOSE 8000
@@ -30,6 +30,6 @@ ENV PORT=8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the unified application
-CMD ["python", "server_unified.py", "8000"]
+# Run the production application
+CMD ["python", "server_production.py"]
 
