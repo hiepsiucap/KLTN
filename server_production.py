@@ -9,7 +9,7 @@ Deploy-ready cho AWS EC2
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Dict, Optional
 import openai
 import json
@@ -19,6 +19,10 @@ import uvicorn
 import logging
 from datetime import datetime
 import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # ============================================================================
 # Configuration
@@ -67,16 +71,29 @@ class Education(BaseModel):
     degree: str
     institution: str
     graduation_year: Optional[int] = None
+    description: Optional[str] = None
     gpa: Optional[float] = None
 
 class Experience(BaseModel):
     title: str
     company: str
     duration: str
+    description: Optional[str] = None
     responsibilities: List[str]
     achievements: Optional[List[str]] = []
 
+class Project(BaseModel):
+    name: str
+    description: Optional[str] = None
+    technologies: Optional[List[str]] = []
+    url: Optional[str] = None
+    duration: Optional[str] = None
+    role: Optional[str] = None
+    achievements: Optional[List[str]] = []
+
 class CV(BaseModel):
+    model_config = ConfigDict(ser_json_timedelta='iso8601')
+    
     name: str
     email: str
     phone: Optional[str] = None
@@ -84,8 +101,10 @@ class CV(BaseModel):
     skills: List[str]
     education: List[Education]
     experience: List[Experience]
-    certifications: Optional[List[str]] = []
-    languages: Optional[List[str]] = []
+    projects: List[Project] = []
+    certifications: List[str] = []
+    languages: List[str] = []
+    achievements: List[str] = []
 
 class JobDescription(BaseModel):
     title: str
@@ -136,6 +155,62 @@ class ScoreResponse(BaseModel):
     resume_completion_method: str
     is_few_shot_user: bool
     interaction_count: int
+    deterministic: bool = True
+    error: Optional[str] = None
+
+
+# ============================================================================
+# NEW: CV Evaluation Models (Single Score Output)
+# ============================================================================
+
+class EvaluateRequest(BaseModel):
+    """Request để đánh giá CV - trả về MỘT điểm duy nhất"""
+    cv: CV
+    interaction_history: Optional[InteractionHistory] = None
+
+class ScoreBreakdown(BaseModel):
+    """Chi tiết điểm từng tiêu chí"""
+    skills_score: float              # Điểm kỹ năng (0-100)
+    experience_score: float          # Điểm kinh nghiệm (0-100)
+    education_score: float           # Điểm học vấn (0-100)
+    completeness_score: float        # Độ đầy đủ CV (0-100)
+    job_alignment_score: float       # Độ phù hợp với jobs đã apply (0-100)
+    presentation_score: float        # Điểm trình bày/format (0-100)
+
+
+class CVEdit(BaseModel):
+    """Đề xuất sửa cụ thể một field trong CV JSON"""
+    field_path: str                  # Path đến field cần sửa, e.g., "skills", "experience[0].achievements"
+    action: str                      # "add", "update", "remove", "rewrite"
+    current_value: Optional[str] = None    # Giá trị hiện tại (nếu có)
+    suggested_value: str             # Giá trị đề xuất
+    reason: str                      # Lý do cần sửa
+    priority: str                    # "high", "medium", "low"
+    impact_score: Optional[float] = None   # Điểm tăng dự kiến nếu sửa
+
+
+class EvaluateResponse(BaseModel):
+    """Response với MỘT điểm tổng hợp duy nhất"""
+    success: bool
+    cv_name: str
+    
+    # === MỘT ĐIỂM DUY NHẤT ===
+    overall_score: float             # Điểm tổng (0-100)
+    grade: str                       # Xếp hạng: A, B, C, D, F
+    
+    # Chi tiết điểm
+    score_breakdown: ScoreBreakdown
+    
+    # Phân tích
+    strengths: List[str]             # Điểm mạnh
+    weaknesses: List[str]            # Điểm yếu
+    recommendations: List[str]       # Gợi ý cải thiện
+    
+    # === ĐỀ XUẤT SỬA CV CỤ THỂ ===
+    cv_edits: List[CVEdit]           # Danh sách các đề xuất sửa cụ thể trong JSON
+    
+    # Metadata
+    jobs_analyzed: int               # Số jobs đã phân tích
     deterministic: bool = True
     error: Optional[str] = None
 
@@ -276,6 +351,7 @@ Please extract and return in this EXACT JSON format:
             "degree": "Degree name",
             "institution": "School name",
             "graduation_year": 2020,
+            "description": "Description of study/major",
             "gpa": 3.5
         }}
     ],
@@ -284,12 +360,25 @@ Please extract and return in this EXACT JSON format:
             "title": "Job title",
             "company": "Company name",
             "duration": "Duration string",
+            "description": "Brief description of the role",
             "responsibilities": ["Task 1", "Task 2", ...],
             "achievements": ["Achievement 1", ...]
         }}
     ],
+    "projects": [
+        {{
+            "name": "Project name",
+            "description": "What the project does",
+            "technologies": ["Tech 1", "Tech 2", ...],
+            "url": "Project URL if any",
+            "duration": "Duration string",
+            "role": "Your role in the project",
+            "achievements": ["Achievement 1", ...]
+        }}
+    ],
     "certifications": ["Cert 1", ...],
-    "languages": ["Language 1", ...]
+    "languages": ["Language 1", ...],
+    "achievements": ["Overall achievement 1", ...]
 }}
 
 Rules:
@@ -317,6 +406,10 @@ JSON:"""
         Experience(**exp) for exp in cv_data_dict.get('experience', [])
     ]
     
+    project_list = [
+        Project(**proj) for proj in cv_data_dict.get('projects', [])
+    ]
+    
     cv = CV(
         name=cv_data_dict.get('name', 'Unknown'),
         email=cv_data_dict.get('email', ''),
@@ -325,8 +418,10 @@ JSON:"""
         skills=cv_data_dict.get('skills', []),
         education=education_list,
         experience=experience_list,
+        projects=project_list,
         certifications=cv_data_dict.get('certifications', []),
-        languages=cv_data_dict.get('languages', [])
+        languages=cv_data_dict.get('languages', []),
+        achievements=cv_data_dict.get('achievements', [])
     )
     
     return cv
@@ -600,6 +695,297 @@ def generate_overall_analysis(cv, method, quality, is_few_shot, count, score, re
 
 
 # ============================================================================
+# ROUTE 3: EVALUATE CV (Single Score)
+# ============================================================================
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+async def evaluate_cv(request: EvaluateRequest):
+    """
+    Đánh giá CV và trả về MỘT ĐIỂM TỔNG HỢP DUY NHẤT
+    
+    Tiêu chí đánh giá:
+    - Skills: Số lượng và chất lượng kỹ năng
+    - Experience: Kinh nghiệm làm việc
+    - Education: Trình độ học vấn
+    - Completeness: Độ đầy đủ thông tin CV
+    - Job Alignment: Độ phù hợp với jobs đã apply (nếu có)
+    - Presentation: Chất lượng trình bày
+    
+    Output: MỘT điểm overall_score (0-100) và grade (A-F)
+    """
+    logger.info(f"📊 Evaluating CV: {request.cv.name}")
+    
+    try:
+        cv = request.cv
+        interaction_count = 0
+        jobs_list = []
+        
+        if request.interaction_history:
+            interaction_count = request.interaction_history.interaction_count
+            jobs_list = request.interaction_history.job_descriptions
+        
+        logger.info(f"   Jobs in history: {len(jobs_list)}")
+        
+        # Gọi LLM để đánh giá tổng hợp
+        evaluation = evaluate_cv_comprehensive(cv, jobs_list)
+        
+        # Tính điểm tổng hợp (weighted average)
+        breakdown = evaluation["breakdown"]
+        
+        # Trọng số cho từng tiêu chí
+        weights = {
+            "skills": 0.25,
+            "experience": 0.25,
+            "education": 0.15,
+            "completeness": 0.15,
+            "job_alignment": 0.10,
+            "presentation": 0.10
+        }
+        
+        overall_score = (
+            breakdown["skills_score"] * weights["skills"] +
+            breakdown["experience_score"] * weights["experience"] +
+            breakdown["education_score"] * weights["education"] +
+            breakdown["completeness_score"] * weights["completeness"] +
+            breakdown["job_alignment_score"] * weights["job_alignment"] +
+            breakdown["presentation_score"] * weights["presentation"]
+        )
+        
+        # Xác định grade
+        grade = calculate_grade(overall_score)
+        
+        logger.info(f"✅ Evaluation complete: {overall_score:.1f}/100 (Grade: {grade})")
+        
+        # Parse cv_edits từ evaluation
+        cv_edits_raw = evaluation.get("cv_edits", [])
+        cv_edits = [
+            CVEdit(
+                field_path=edit.get("field_path", ""),
+                action=edit.get("action", "add"),
+                current_value=edit.get("current_value"),
+                suggested_value=edit.get("suggested_value", ""),
+                reason=edit.get("reason", ""),
+                priority=edit.get("priority", "medium"),
+                impact_score=edit.get("impact_score")
+            )
+            for edit in cv_edits_raw
+        ]
+        
+        logger.info(f"   CV Edits suggested: {len(cv_edits)}")
+        
+        return EvaluateResponse(
+            success=True,
+            cv_name=cv.name,
+            overall_score=round(overall_score, 1),
+            grade=grade,
+            score_breakdown=ScoreBreakdown(
+                skills_score=breakdown["skills_score"],
+                experience_score=breakdown["experience_score"],
+                education_score=breakdown["education_score"],
+                completeness_score=breakdown["completeness_score"],
+                job_alignment_score=breakdown["job_alignment_score"],
+                presentation_score=breakdown["presentation_score"]
+            ),
+            strengths=evaluation["strengths"],
+            weaknesses=evaluation["weaknesses"],
+            recommendations=evaluation["recommendations"],
+            cv_edits=cv_edits,
+            jobs_analyzed=len(jobs_list),
+            deterministic=True
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Evaluation error: {e}")
+        return EvaluateResponse(
+            success=False,
+            cv_name=request.cv.name,
+            overall_score=0,
+            grade="F",
+            score_breakdown=ScoreBreakdown(
+                skills_score=0, experience_score=0, education_score=0,
+                completeness_score=0, job_alignment_score=0, presentation_score=0
+            ),
+            strengths=[],
+            weaknesses=[],
+            recommendations=[],
+            cv_edits=[],
+            jobs_analyzed=0,
+            error=str(e)
+        )
+
+
+def evaluate_cv_comprehensive(cv: CV, jobs_list: List[JobDescription]) -> Dict:
+    """Đánh giá CV tổng hợp với LLM + đề xuất sửa cụ thể"""
+    
+    # Chuẩn bị thông tin CV chi tiết cho việc đề xuất sửa
+    cv_json_structure = f"""
+CV JSON Structure:
+{{
+  "name": "{cv.name}",
+  "email": "{cv.email}",
+  "phone": "{cv.phone or 'null'}",
+  "summary": "{(cv.summary or 'null')[:100]}...",
+  "skills": {json.dumps(cv.skills[:10] if cv.skills else [], ensure_ascii=False)}{"..." if len(cv.skills) > 10 else ""},
+  "education": [
+{chr(10).join([f'    {{"degree": "{edu.degree}", "institution": "{edu.institution}", "gpa": {edu.gpa or "null"}}}' for edu in cv.education[:3]])}
+  ],
+  "experience": [
+{chr(10).join([f'    {{"title": "{exp.title}", "company": "{exp.company}", "duration": "{exp.duration}", "responsibilities": {len(exp.responsibilities)} items, "achievements": {len(exp.achievements or [])} items}}' for exp in cv.experience[:3]])}
+  ],
+  "certifications": {json.dumps(cv.certifications[:5] if cv.certifications else [], ensure_ascii=False)},
+  "languages": {json.dumps(cv.languages[:5] if cv.languages else [], ensure_ascii=False)}
+}}
+"""
+
+    cv_info = f"""
+CV Information:
+- Name: {cv.name}
+- Email: {cv.email}
+- Phone: {cv.phone or 'Not provided'}
+- Summary: {cv.summary or 'Not provided'}
+- Skills: {', '.join(cv.skills) if cv.skills else 'None listed'}
+- Number of skills: {len(cv.skills)}
+- Education entries: {len(cv.education)}
+- Experience entries: {len(cv.experience)}
+- Certifications: {len(cv.certifications or [])}
+- Languages: {len(cv.languages or [])}
+
+Education Details:
+{chr(10).join([f"  - {edu.degree} at {edu.institution}" + (f" (GPA: {edu.gpa})" if edu.gpa else "") for edu in cv.education]) if cv.education else "  None"}
+
+Experience Details:
+{chr(10).join([f"  - {exp.title} at {exp.company} ({exp.duration})" + (f" - Achievements: {len(exp.achievements or [])} items" if exp.achievements else " - No achievements listed") for exp in cv.experience]) if cv.experience else "  None"}
+
+{cv_json_structure}
+"""
+    
+    # Thông tin jobs đã apply (nếu có)
+    jobs_info = ""
+    required_skills_from_jobs = []
+    if jobs_list:
+        for job in jobs_list:
+            required_skills_from_jobs.extend(job.required_skills)
+        required_skills_from_jobs = list(set(required_skills_from_jobs))
+        
+        jobs_info = f"""
+Jobs Applied/Interested ({len(jobs_list)} jobs):
+{chr(10).join([f"  - {job.title} at {job.company}: requires {', '.join(job.required_skills[:5])}" for job in jobs_list[:10]])}
+
+All Required Skills from Jobs: {', '.join(required_skills_from_jobs[:20])}
+"""
+    else:
+        jobs_info = "\nNo job interaction history available."
+    
+    prompt = f"""You are an expert HR consultant. Evaluate this CV and provide SPECIFIC EDIT SUGGESTIONS for the CV JSON.
+
+{cv_info}
+{jobs_info}
+
+TASK 1: Score each criterion from 0-100:
+1. SKILLS_SCORE: Quality and quantity of skills (0-30: Few, 31-60: Moderate, 61-80: Good, 81-100: Excellent)
+2. EXPERIENCE_SCORE: Work experience quality (0-30: Entry, 31-60: Some, 61-80: Good, 81-100: Extensive)
+3. EDUCATION_SCORE: Educational background (0-30: Basic, 31-60: Bachelor's, 61-80: Good uni, 81-100: Advanced)
+4. COMPLETENESS_SCORE: How complete is the CV?
+5. JOB_ALIGNMENT_SCORE: Match with jobs applied (if no history: 50-70 based on marketability)
+6. PRESENTATION_SCORE: CV quality and professionalism
+
+TASK 2: Provide SPECIFIC EDITS to improve the CV JSON. For each edit, specify:
+- field_path: The exact JSON path (e.g., "skills", "summary", "experience[0].achievements", "certifications")
+- action: "add" (add new item), "update" (modify existing), "remove" (delete), "rewrite" (completely rewrite)
+- current_value: Current value (if updating/rewriting)
+- suggested_value: The exact new value to use
+- reason: Why this change will improve the CV
+- priority: "high", "medium", or "low"
+- impact_score: Estimated score increase (1-10 points)
+
+Return ONLY valid JSON:
+{{
+    "breakdown": {{
+        "skills_score": <0-100>,
+        "experience_score": <0-100>,
+        "education_score": <0-100>,
+        "completeness_score": <0-100>,
+        "job_alignment_score": <0-100>,
+        "presentation_score": <0-100>
+    }},
+    "strengths": ["strength1", "strength2", "strength3"],
+    "weaknesses": ["weakness1", "weakness2", "weakness3"],
+    "recommendations": ["rec1", "rec2", "rec3", "rec4", "rec5"],
+    "cv_edits": [
+        {{
+            "field_path": "skills",
+            "action": "add",
+            "current_value": null,
+            "suggested_value": "Docker",
+            "reason": "Docker is required by 3 of the jobs you applied for",
+            "priority": "high",
+            "impact_score": 5
+        }},
+        {{
+            "field_path": "summary",
+            "action": "rewrite",
+            "current_value": "Current summary text...",
+            "suggested_value": "Results-driven Backend Developer with 3+ years of experience...",
+            "reason": "Summary should highlight key achievements and be more specific",
+            "priority": "high",
+            "impact_score": 8
+        }},
+        {{
+            "field_path": "experience[0].achievements",
+            "action": "add",
+            "current_value": null,
+            "suggested_value": "Reduced API response time by 40% through query optimization",
+            "reason": "Quantified achievements significantly improve CV impact",
+            "priority": "high",
+            "impact_score": 7
+        }}
+    ]
+}}
+
+IMPORTANT: 
+- Provide 5-10 specific cv_edits
+- Focus on high-impact changes first
+- Be specific with suggested_value (provide actual text, not placeholders)
+- Use correct field_path syntax for nested fields"""
+
+    messages = [
+        {"role": "system", "content": "Expert HR consultant. Evaluate CVs and provide specific, actionable edit suggestions. Return only valid JSON."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    result = call_llm(messages, max_tokens=3000)
+    return json.loads(result)
+
+
+def calculate_grade(score: float) -> str:
+    """Tính grade từ điểm số"""
+    if score >= 90:
+        return "A+"
+    elif score >= 85:
+        return "A"
+    elif score >= 80:
+        return "A-"
+    elif score >= 75:
+        return "B+"
+    elif score >= 70:
+        return "B"
+    elif score >= 65:
+        return "B-"
+    elif score >= 60:
+        return "C+"
+    elif score >= 55:
+        return "C"
+    elif score >= 50:
+        return "C-"
+    elif score >= 45:
+        return "D+"
+    elif score >= 40:
+        return "D"
+    else:
+        return "F"
+
+
+# ============================================================================
 # Health Check & Info Routes
 # ============================================================================
 
@@ -607,12 +993,13 @@ def generate_overall_analysis(cv, method, quality, is_few_shot, count, score, re
 async def root():
     return {
         "service": "LGIR CV Matching API - Production",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "active",
         "routes": {
             "parse_pdf": "POST /parse/pdf - Upload PDF CV to parse",
             "parse_text": "POST /parse/text - Parse CV text",
-            "score": "POST /score - Score CV matching with jobs",
+            "score": "POST /score - Score CV matching with multiple jobs",
+            "evaluate": "POST /evaluate - Evaluate CV → ONE overall score (0-100)",
             "health": "GET /health - Health check",
             "docs": "GET /docs - API documentation"
         }
@@ -635,7 +1022,7 @@ async def health_check():
 # ============================================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8000))
+    port = int(os.getenv('PORT', 9000))
     
     print("="*80)
     print("🚀 LGIR CV Matching API - Production Server")
@@ -645,7 +1032,8 @@ if __name__ == "__main__":
     print("\n🔧 Routes:")
     print("   POST /parse/pdf  - Parse PDF CV")
     print("   POST /parse/text - Parse text CV")
-    print("   POST /score      - Score CV matching")
+    print("   POST /score      - Score CV matching with jobs")
+    print("   POST /evaluate   - Evaluate CV → ONE score (NEW!)")
     print("   GET  /health     - Health check")
     print("\n" + "="*80 + "\n")
     
