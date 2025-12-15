@@ -758,18 +758,39 @@ async def evaluate_cv(request: EvaluateRequest):
         
         # Parse cv_edits từ evaluation
         cv_edits_raw = evaluation.get("cv_edits", [])
-        cv_edits = [
-            CVEdit(
-                field_path=edit.get("field_path", ""),
-                action=edit.get("action", "add"),
-                current_value=edit.get("current_value"),
-                suggested_value=edit.get("suggested_value", ""),
-                reason=edit.get("reason", ""),
-                priority=edit.get("priority", "medium"),
-                impact_score=edit.get("impact_score")
-            )
-            for edit in cv_edits_raw
-        ]
+        cv_edits = []
+        for edit in cv_edits_raw:
+            # Xử lý suggested_value: convert sang string nếu là list/dict
+            suggested_val = edit.get("suggested_value", "")
+            if isinstance(suggested_val, (list, dict)):
+                suggested_val = json.dumps(suggested_val, ensure_ascii=False)
+            elif suggested_val is None:
+                suggested_val = ""
+            else:
+                suggested_val = str(suggested_val)
+            
+            # Xử lý current_value tương tự
+            current_val = edit.get("current_value")
+            if isinstance(current_val, (list, dict)):
+                current_val = json.dumps(current_val, ensure_ascii=False)
+            elif current_val is not None:
+                current_val = str(current_val)
+            
+            try:
+                cv_edits.append(
+                    CVEdit(
+                        field_path=edit.get("field_path", ""),
+                        action=edit.get("action", "add"),
+                        current_value=current_val,
+                        suggested_value=suggested_val,
+                        reason=edit.get("reason", ""),
+                        priority=edit.get("priority", "medium"),
+                        impact_score=edit.get("impact_score")
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to parse cv_edit: {e}. Skipping this edit.")
+                continue
         
         logger.info(f"   CV Edits suggested: {len(cv_edits)}")
         
@@ -1022,7 +1043,7 @@ async def health_check():
 # ============================================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 9000))
+    port = int(os.getenv('PORT', 10800))
     
     print("="*80)
     print("🚀 LGIR CV Matching API - Production Server")
