@@ -168,6 +168,13 @@ class EvaluateRequest(BaseModel):
     cv: CV
     interaction_history: Optional[InteractionHistory] = None
 
+
+class EvaluateWithJDRequest(BaseModel):
+    """Request để đánh giá CV với target JD và các similar JDs tham khảo"""
+    cv: CV
+    target_jd: JobDescription                    # JD chính, chú trọng nhất
+    similar_jds: Optional[List[JobDescription]] = []  # JDs tương tự để tham khảo thêm
+
 class ScoreBreakdown(BaseModel):
     """Chi tiết điểm từng tiêu chí"""
     skills_score: float              # Điểm kỹ năng (0-100)
@@ -1007,6 +1014,325 @@ def calculate_grade(score: float) -> str:
 
 
 # ============================================================================
+# ROUTE 4: EVALUATE CV WITH TARGET JD + SIMILAR JDs
+# ============================================================================
+
+@app.post("/evaluate/with-jd", response_model=EvaluateResponse)
+async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
+    """
+    Đánh giá CV dựa trên:
+    - Target JD (chú trọng chính, đánh giá phù hợp với JD này)
+    - Similar JDs (tham khảo thêm các skills/requirements tương tự)
+    
+    Output: MỘT điểm overall_score (0-100), grade (A-F), và các đề xuất sửa CV cụ thể
+    """
+    logger.info(f"📊 Evaluating CV with Target JD: {request.cv.name}")
+    logger.info(f"   Target JD: {request.target_jd.title} at {request.target_jd.company}")
+    logger.info(f"   Similar JDs: {len(request.similar_jds or [])}")
+    
+    try:
+        cv = request.cv
+        target_jd = request.target_jd
+        similar_jds = request.similar_jds or []
+        
+        # Gọi LLM để đánh giá tổng hợp với focus vào target JD
+        evaluation = evaluate_cv_with_target_jd(cv, target_jd, similar_jds)
+        
+        # Tính điểm tổng hợp (weighted average)
+        breakdown = evaluation["breakdown"]
+        
+        # Trọng số cho từng tiêu chí - JOB ALIGNMENT cao hơn vì có target JD
+        weights = {
+            "skills": 0.25,
+            "experience": 0.20,
+            "education": 0.10,
+            "completeness": 0.10,
+            "job_alignment": 0.25,  # Cao hơn vì có target JD cụ thể
+            "presentation": 0.10
+        }
+        
+        overall_score = (
+            breakdown["skills_score"] * weights["skills"] +
+            breakdown["experience_score"] * weights["experience"] +
+            breakdown["education_score"] * weights["education"] +
+            breakdown["completeness_score"] * weights["completeness"] +
+            breakdown["job_alignment_score"] * weights["job_alignment"] +
+            breakdown["presentation_score"] * weights["presentation"]
+        )
+        
+        # Xác định grade
+        grade = calculate_grade(overall_score)
+        
+        logger.info(f"✅ Evaluation complete: {overall_score:.1f}/100 (Grade: {grade})")
+        
+        # Parse cv_edits từ evaluation
+        cv_edits_raw = evaluation.get("cv_edits", [])
+        cv_edits = []
+        for edit in cv_edits_raw:
+            # Xử lý suggested_value: convert sang string nếu là list/dict
+            suggested_val = edit.get("suggested_value", "")
+            if isinstance(suggested_val, (list, dict)):
+                suggested_val = json.dumps(suggested_val, ensure_ascii=False)
+            elif suggested_val is None:
+                suggested_val = ""
+            else:
+                suggested_val = str(suggested_val)
+            
+            # Xử lý current_value tương tự
+            current_val = edit.get("current_value")
+            if isinstance(current_val, (list, dict)):
+                current_val = json.dumps(current_val, ensure_ascii=False)
+            elif current_val is not None:
+                current_val = str(current_val)
+            
+            try:
+                cv_edits.append(
+                    CVEdit(
+                        field_path=edit.get("field_path", ""),
+                        action=edit.get("action", "add"),
+                        current_value=current_val,
+                        suggested_value=suggested_val,
+                        reason=edit.get("reason", ""),
+                        priority=edit.get("priority", "medium"),
+                        impact_score=edit.get("impact_score")
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to parse cv_edit: {e}. Skipping this edit.")
+                continue
+        
+        logger.info(f"   CV Edits suggested: {len(cv_edits)}")
+        
+        return EvaluateResponse(
+            success=True,
+            cv_name=cv.name,
+            overall_score=round(overall_score, 1),
+            grade=grade,
+            score_breakdown=ScoreBreakdown(
+                skills_score=breakdown["skills_score"],
+                experience_score=breakdown["experience_score"],
+                education_score=breakdown["education_score"],
+                completeness_score=breakdown["completeness_score"],
+                job_alignment_score=breakdown["job_alignment_score"],
+                presentation_score=breakdown["presentation_score"]
+            ),
+            strengths=evaluation["strengths"],
+            weaknesses=evaluation["weaknesses"],
+            recommendations=evaluation["recommendations"],
+            cv_edits=cv_edits,
+            jobs_analyzed=1 + len(similar_jds),  # target + similar
+            deterministic=True
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Evaluation error: {e}")
+        return EvaluateResponse(
+            success=False,
+            cv_name=request.cv.name,
+            overall_score=0,
+            grade="F",
+            score_breakdown=ScoreBreakdown(
+                skills_score=0, experience_score=0, education_score=0,
+                completeness_score=0, job_alignment_score=0, presentation_score=0
+            ),
+            strengths=[],
+            weaknesses=[],
+            recommendations=[],
+            cv_edits=[],
+            jobs_analyzed=0,
+            error=str(e)
+        )
+
+
+def evaluate_cv_with_target_jd(cv: CV, target_jd: JobDescription, similar_jds: List[JobDescription]) -> Dict:
+    """
+    Đánh giá CV với focus vào target JD, tham khảo similar JDs cho additional skills.
+    
+    - Target JD: Đánh giá chính, skills match, requirements match
+    - Similar JDs: Tham khảo thêm skills tương tự, requirements phổ biến trong ngành
+    """
+    
+    # Chuẩn bị thông tin CV chi tiết
+    cv_json_structure = f"""
+CV JSON Structure:
+{{
+  "name": "{cv.name}",
+  "email": "{cv.email}",
+  "phone": "{cv.phone or 'null'}",
+  "summary": "{(cv.summary or 'null')[:100]}...",
+  "skills": {json.dumps(cv.skills[:10] if cv.skills else [], ensure_ascii=False)}{"..." if len(cv.skills) > 10 else ""},
+  "education": [
+{chr(10).join([f'    {{"degree": "{edu.degree}", "institution": "{edu.institution}", "gpa": {edu.gpa or "null"}}}' for edu in cv.education[:3]])}
+  ],
+  "experience": [
+{chr(10).join([f'    {{"title": "{exp.title}", "company": "{exp.company}", "duration": "{exp.duration}", "responsibilities": {len(exp.responsibilities)} items, "achievements": {len(exp.achievements or [])} items}}' for exp in cv.experience[:3]])}
+  ],
+  "certifications": {json.dumps(cv.certifications[:5] if cv.certifications else [], ensure_ascii=False)},
+  "languages": {json.dumps(cv.languages[:5] if cv.languages else [], ensure_ascii=False)}
+}}
+"""
+
+    cv_info = f"""
+CV Information:
+- Name: {cv.name}
+- Email: {cv.email}
+- Phone: {cv.phone or 'Not provided'}
+- Summary: {cv.summary or 'Not provided'}
+- Skills: {', '.join(cv.skills) if cv.skills else 'None listed'}
+- Number of skills: {len(cv.skills)}
+- Education entries: {len(cv.education)}
+- Experience entries: {len(cv.experience)}
+- Certifications: {len(cv.certifications or [])}
+- Languages: {len(cv.languages or [])}
+
+Education Details:
+{chr(10).join([f"  - {edu.degree} at {edu.institution}" + (f" (GPA: {edu.gpa})" if edu.gpa else "") for edu in cv.education]) if cv.education else "  None"}
+
+Experience Details:
+{chr(10).join([f"  - {exp.title} at {exp.company} ({exp.duration})" + (f" - Achievements: {len(exp.achievements or [])} items" if exp.achievements else " - No achievements listed") for exp in cv.experience]) if cv.experience else "  None"}
+
+{cv_json_structure}
+"""
+    
+    # ===== TARGET JD (CHÍNH - CHÚ TRỌNG NHẤT) =====
+    target_jd_info = f"""
+===== TARGET JOB DESCRIPTION (PRIMARY - FOCUS ON THIS) =====
+Title: {target_jd.title}
+Company: {target_jd.company}
+
+REQUIRED SKILLS (MUST HAVE):
+{chr(10).join([f"  ★ {skill}" for skill in target_jd.required_skills])}
+
+REQUIREMENTS:
+{chr(10).join([f"  - {req}" for req in target_jd.requirements])}
+
+RESPONSIBILITIES:
+{chr(10).join([f"  - {resp}" for resp in target_jd.responsibilities[:5]])}
+
+PREFERRED QUALIFICATIONS:
+{chr(10).join([f"  - {qual}" for qual in (target_jd.preferred_qualifications or [])[:5]]) or "  None specified"}
+"""
+    
+    # ===== SIMILAR JDs (THAM KHẢO) =====
+    similar_jds_info = ""
+    all_similar_skills = []
+    all_similar_requirements = []
+    
+    if similar_jds:
+        for jd in similar_jds:
+            all_similar_skills.extend(jd.required_skills)
+            all_similar_requirements.extend(jd.requirements[:3])
+        
+        # Deduplicate
+        all_similar_skills = list(set(all_similar_skills))
+        all_similar_requirements = list(set(all_similar_requirements))
+        
+        similar_jds_info = f"""
+===== SIMILAR JOB DESCRIPTIONS (FOR REFERENCE ONLY) =====
+These similar JDs provide additional context on common skills and requirements in this field.
+Use these to identify additional valuable skills the candidate might need.
+
+Similar Positions ({len(similar_jds)} jobs):
+{chr(10).join([f"  • {jd.title} at {jd.company} - Skills: {', '.join(jd.required_skills[:5])}" for jd in similar_jds[:5]])}
+
+Common Skills across Similar JDs (for reference):
+{', '.join(all_similar_skills[:15])}
+
+Common Requirements across Similar JDs (for reference):
+{chr(10).join([f"  - {req}" for req in all_similar_requirements[:5]])}
+"""
+    else:
+        similar_jds_info = "\nNo similar JDs provided for reference."
+    
+    prompt = f"""You are an expert HR consultant. Evaluate this CV PRIMARILY against the TARGET JOB DESCRIPTION.
+The similar JDs are only for REFERENCE to identify additional relevant skills in the field.
+
+{cv_info}
+
+{target_jd_info}
+
+{similar_jds_info}
+
+===== EVALUATION INSTRUCTIONS =====
+
+PRIORITY ORDER:
+1. **TARGET JD is PRIMARY** - Evaluate CV match against target JD's requirements, skills, responsibilities
+2. **Similar JDs are SECONDARY** - Only use to identify additional skills that could strengthen the candidate
+
+TASK 1: Score each criterion from 0-100:
+1. SKILLS_SCORE: How well do the CV skills match the TARGET JD required skills? (Also note gaps from similar JDs)
+2. EXPERIENCE_SCORE: Does experience match TARGET JD requirements?
+3. EDUCATION_SCORE: Does education meet TARGET JD requirements?
+4. COMPLETENESS_SCORE: How complete is the CV overall?
+5. JOB_ALIGNMENT_SCORE: Overall fit with TARGET JD (weight this heavily!)
+6. PRESENTATION_SCORE: CV quality and professionalism
+
+TASK 2: Provide SPECIFIC EDITS to improve CV for the TARGET JD:
+- Focus edits on skills/experience gaps for the TARGET JD
+- Suggest additional skills from similar JDs that would strengthen the application
+- Be specific with field_path, action, suggested_value
+
+Return ONLY valid JSON:
+{{
+    "breakdown": {{
+        "skills_score": <0-100>,
+        "experience_score": <0-100>,
+        "education_score": <0-100>,
+        "completeness_score": <0-100>,
+        "job_alignment_score": <0-100>,
+        "presentation_score": <0-100>
+    }},
+    "strengths": ["strength1 (specific to target JD match)", "strength2", "strength3"],
+    "weaknesses": ["weakness1 (gap vs target JD)", "weakness2", "weakness3"],
+    "recommendations": ["rec1 (priority for target JD)", "rec2", "rec3", "rec4", "rec5"],
+    "cv_edits": [
+        {{
+            "field_path": "skills",
+            "action": "add",
+            "current_value": null,
+            "suggested_value": "skill_from_target_jd",
+            "reason": "This skill is required by the target JD: {target_jd.title}",
+            "priority": "high",
+            "impact_score": 8
+        }},
+        {{
+            "field_path": "summary",
+            "action": "rewrite",
+            "current_value": "...",
+            "suggested_value": "Tailored summary for {target_jd.title} role...",
+            "reason": "Summary should be tailored for the target position",
+            "priority": "high",
+            "impact_score": 7
+        }},
+        {{
+            "field_path": "skills",
+            "action": "add",
+            "current_value": null,
+            "suggested_value": "skill_from_similar_jds",
+            "reason": "Common skill in similar roles that would strengthen your profile",
+            "priority": "medium",
+            "impact_score": 4
+        }}
+    ]
+}}
+
+IMPORTANT:
+- Provide 5-10 specific cv_edits
+- HIGH priority edits should address TARGET JD gaps
+- MEDIUM priority edits can include skills from similar JDs
+- Be specific with suggested_value (provide actual text)
+- Strengths/weaknesses should specifically reference TARGET JD match"""
+
+    messages = [
+        {"role": "system", "content": f"Expert HR consultant evaluating CV fit for '{target_jd.title}' position. Focus on target JD, use similar JDs only as reference. Return only valid JSON."},
+        {"role": "user", "content": prompt}
+    ]
+    
+    result = call_llm(messages, max_tokens=3500)
+    return json.loads(result)
+
+
+# ============================================================================
 # Health Check & Info Routes
 # ============================================================================
 
@@ -1014,13 +1340,14 @@ def calculate_grade(score: float) -> str:
 async def root():
     return {
         "service": "LGIR CV Matching API - Production",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "status": "active",
         "routes": {
             "parse_pdf": "POST /parse/pdf - Upload PDF CV to parse",
             "parse_text": "POST /parse/text - Parse CV text",
             "score": "POST /score - Score CV matching with multiple jobs",
             "evaluate": "POST /evaluate - Evaluate CV → ONE overall score (0-100)",
+            "evaluate_with_jd": "POST /evaluate/with-jd - Evaluate CV with target JD + similar JDs",
             "health": "GET /health - Health check",
             "docs": "GET /docs - API documentation"
         }
@@ -1051,11 +1378,12 @@ if __name__ == "__main__":
     print(f"\n📍 Running on: http://0.0.0.0:{port}")
     print(f"📚 API Docs: http://0.0.0.0:{port}/docs")
     print("\n🔧 Routes:")
-    print("   POST /parse/pdf  - Parse PDF CV")
-    print("   POST /parse/text - Parse text CV")
-    print("   POST /score      - Score CV matching with jobs")
-    print("   POST /evaluate   - Evaluate CV → ONE score (NEW!)")
-    print("   GET  /health     - Health check")
+    print("   POST /parse/pdf       - Parse PDF CV")
+    print("   POST /parse/text      - Parse text CV")
+    print("   POST /score           - Score CV matching with jobs")
+    print("   POST /evaluate        - Evaluate CV → ONE score")
+    print("   POST /evaluate/with-jd - Evaluate CV with target JD + similar JDs (NEW!)")
+    print("   GET  /health          - Health check")
     print("\n" + "="*80 + "\n")
     
     uvicorn.run(
