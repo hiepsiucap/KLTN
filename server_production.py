@@ -21,6 +21,27 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 
+# Import skill processing modules
+try:
+    from skill_processor import (
+        calculate_skill_gap,
+        format_skill_gap_for_prompt,
+        format_skill_gap_json,
+        get_learning_recommendations,
+        extract_skills_from_list
+    )
+    from skill_ontology import get_skill, normalize_skill_name, get_all_skills
+    from rag_knowledge import (
+        get_rag_context_for_evaluation,
+        retrieve_skill_knowledge,
+        retrieve_resume_tips,
+        CAREER_PATHS
+    )
+    SKILL_MODULES_AVAILABLE = True
+except ImportError as e:
+    logging.warning(f"Skill modules not available: {e}")
+    SKILL_MODULES_AVAILABLE = False
+
 # Load environment variables
 load_dotenv()
 
@@ -196,6 +217,17 @@ class CVEdit(BaseModel):
     impact_score: Optional[float] = None   # Điểm tăng dự kiến nếu sửa
 
 
+class SkillGapInfo(BaseModel):
+    """Thông tin skill gap analysis"""
+    match_percentage: float          # % skills match
+    gap_severity: str               # "low", "medium", "high", "critical"
+    matching_skills: List[str]      # Skills có trong cả CV và JD
+    missing_skills: List[str]       # Skills JD yêu cầu mà CV thiếu
+    extra_skills: List[str]         # Skills CV có mà JD không yêu cầu
+    high_priority_missing: List[str]  # Missing skills có demand cao
+    quick_wins: List[str]           # Skills dễ học dựa trên skills hiện có
+
+
 class EvaluateResponse(BaseModel):
     """Response với MỘT điểm tổng hợp duy nhất"""
     success: bool
@@ -215,6 +247,9 @@ class EvaluateResponse(BaseModel):
     
     # === ĐỀ XUẤT SỬA CV CỤ THỂ ===
     cv_edits: List[CVEdit]           # Danh sách các đề xuất sửa cụ thể trong JSON
+    
+    # === SKILL GAP ANALYSIS (NEW) ===
+    skill_gap: Optional[SkillGapInfo] = None  # Phân tích skill gap chi tiết
     
     # Metadata
     jobs_analyzed: int               # Số jobs đã phân tích
@@ -1024,7 +1059,17 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
     - Target JD (chú trọng chính, đánh giá phù hợp với JD này)
     - Similar JDs (tham khảo thêm các skills/requirements tương tự)
     
-    Output: MỘT điểm overall_score (0-100), grade (A-F), và các đề xuất sửa CV cụ thể
+    Flow theo diagram:
+    1. Thu thập & chuẩn hóa dữ liệu đầu vào
+    2. Trích xuất kỹ năng từ CV và JD
+    3. Mapping vào ontology kỹ năng
+    4. Tính skill gap (CV vs JD)
+    5. Xây dựng ngữ cảnh CV + JD + skill gap
+    6. Truy hồi tri thức liên quan (RAG)
+    7. Gọi LLM sinh gợi ý chỉnh sửa CV
+    8. Hậu xử lý & chuẩn hóa output
+    
+    Output: overall_score (0-100), grade (A-F), skill_gap, cv_edits
     """
     logger.info(f"📊 Evaluating CV with Target JD: {request.cv.name}")
     logger.info(f"   Target JD: {request.target_jd.title} at {request.target_jd.company}")
@@ -1035,19 +1080,68 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
         target_jd = request.target_jd
         similar_jds = request.similar_jds or []
         
-        # Gọi LLM để đánh giá tổng hợp với focus vào target JD
-        evaluation = evaluate_cv_with_target_jd(cv, target_jd, similar_jds)
+        # ===== STEP 1-4: SKILL GAP ANALYSIS =====
+        skill_gap_info = None
+        rag_context = ""
+        
+        if SKILL_MODULES_AVAILABLE:
+            logger.info("   📌 Running skill gap analysis...")
+            
+            # Collect all JD skills (target + similar)
+            all_jd_skills = list(target_jd.required_skills)
+            for sjd in similar_jds:
+                all_jd_skills.extend(sjd.required_skills)
+            
+            # Calculate skill gap
+            gap_result = calculate_skill_gap(
+                cv_skills=cv.skills,
+                jd_skills=target_jd.required_skills,
+                include_similar_jds_skills=all_jd_skills
+            )
+            
+            logger.info(f"   ✅ Skill gap: {gap_result.match_percentage}% match, {len(gap_result.missing_skills)} missing")
+            
+            # Create skill gap info for response
+            skill_gap_info = SkillGapInfo(
+                match_percentage=gap_result.match_percentage,
+                gap_severity=gap_result.gap_severity,
+                matching_skills=gap_result.matching_skills,
+                missing_skills=gap_result.missing_skills,
+                extra_skills=gap_result.extra_skills[:10],  # Limit to 10
+                high_priority_missing=gap_result.high_priority_missing,
+                quick_wins=gap_result.quick_wins
+            )
+            
+            # ===== STEP 5-6: BUILD RAG CONTEXT =====
+            logger.info("   📚 Building RAG context...")
+            try:
+                rag_context = get_rag_context_for_evaluation(
+                    cv_skills=cv.skills,
+                    jd_skills=target_jd.required_skills,
+                    jd_title=target_jd.title,
+                    skill_gap=gap_result,
+                    use_embeddings=False  # Start with simple context, set True for full RAG
+                )
+            except Exception as rag_error:
+                logger.warning(f"   ⚠️ RAG context failed: {rag_error}")
+                rag_context = format_skill_gap_for_prompt(gap_result)
+        
+        # ===== STEP 7: CALL LLM =====
+        logger.info("   🤖 Calling LLM for evaluation...")
+        evaluation = evaluate_cv_with_target_jd_enhanced(
+            cv, target_jd, similar_jds, rag_context
+        )
         
         # Tính điểm tổng hợp (weighted average)
         breakdown = evaluation["breakdown"]
         
-        # Trọng số cho từng tiêu chí - JOB ALIGNMENT cao hơn vì có target JD
+        # Trọng số - skill alignment quan trọng hơn khi có explicit gap analysis
         weights = {
             "skills": 0.25,
             "experience": 0.20,
             "education": 0.10,
             "completeness": 0.10,
-            "job_alignment": 0.25,  # Cao hơn vì có target JD cụ thể
+            "job_alignment": 0.25,
             "presentation": 0.10
         }
         
@@ -1060,16 +1154,14 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
             breakdown["presentation_score"] * weights["presentation"]
         )
         
-        # Xác định grade
         grade = calculate_grade(overall_score)
         
         logger.info(f"✅ Evaluation complete: {overall_score:.1f}/100 (Grade: {grade})")
         
-        # Parse cv_edits từ evaluation
+        # ===== STEP 8: POST-PROCESS CV EDITS =====
         cv_edits_raw = evaluation.get("cv_edits", [])
         cv_edits = []
         for edit in cv_edits_raw:
-            # Xử lý suggested_value: convert sang string nếu là list/dict
             suggested_val = edit.get("suggested_value", "")
             if isinstance(suggested_val, (list, dict)):
                 suggested_val = json.dumps(suggested_val, ensure_ascii=False)
@@ -1078,7 +1170,6 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
             else:
                 suggested_val = str(suggested_val)
             
-            # Xử lý current_value tương tự
             current_val = edit.get("current_value")
             if isinstance(current_val, (list, dict)):
                 current_val = json.dumps(current_val, ensure_ascii=False)
@@ -1098,7 +1189,7 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
                     )
                 )
             except Exception as e:
-                logger.warning(f"⚠️ Failed to parse cv_edit: {e}. Skipping this edit.")
+                logger.warning(f"⚠️ Failed to parse cv_edit: {e}. Skipping.")
                 continue
         
         logger.info(f"   CV Edits suggested: {len(cv_edits)}")
@@ -1120,12 +1211,15 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
             weaknesses=evaluation["weaknesses"],
             recommendations=evaluation["recommendations"],
             cv_edits=cv_edits,
-            jobs_analyzed=1 + len(similar_jds),  # target + similar
+            skill_gap=skill_gap_info,  # NEW: Include skill gap analysis
+            jobs_analyzed=1 + len(similar_jds),
             deterministic=True
         )
         
     except Exception as e:
         logger.error(f"❌ Evaluation error: {e}")
+        import traceback
+        traceback.print_exc()
         return EvaluateResponse(
             success=False,
             cv_name=request.cv.name,
@@ -1139,17 +1233,26 @@ async def evaluate_cv_with_jd(request: EvaluateWithJDRequest):
             weaknesses=[],
             recommendations=[],
             cv_edits=[],
+            skill_gap=None,
             jobs_analyzed=0,
             error=str(e)
         )
 
 
-def evaluate_cv_with_target_jd(cv: CV, target_jd: JobDescription, similar_jds: List[JobDescription]) -> Dict:
+def evaluate_cv_with_target_jd_enhanced(
+    cv: CV, 
+    target_jd: JobDescription, 
+    similar_jds: List[JobDescription],
+    rag_context: str = ""
+) -> Dict:
     """
     Đánh giá CV với focus vào target JD, tham khảo similar JDs cho additional skills.
     
+    Enhanced version với RAG context từ skill ontology và knowledge base.
+    
     - Target JD: Đánh giá chính, skills match, requirements match
     - Similar JDs: Tham khảo thêm skills tương tự, requirements phổ biến trong ngành
+    - RAG Context: Knowledge từ skill ontology, career paths, resume tips
     """
     
     # Chuẩn bị thông tin CV chi tiết
@@ -1244,6 +1347,13 @@ Common Requirements across Similar JDs (for reference):
     else:
         similar_jds_info = "\nNo similar JDs provided for reference."
     
+    # ===== RAG CONTEXT (KNOWLEDGE FROM ONTOLOGY) =====
+    rag_section = ""
+    if rag_context:
+        rag_section = f"""
+{rag_context}
+"""
+    
     prompt = f"""You are an expert HR consultant. Evaluate this CV PRIMARILY against the TARGET JOB DESCRIPTION.
 The similar JDs are only for REFERENCE to identify additional relevant skills in the field.
 
@@ -1252,12 +1362,14 @@ The similar JDs are only for REFERENCE to identify additional relevant skills in
 {target_jd_info}
 
 {similar_jds_info}
-
+{rag_section}
 ===== EVALUATION INSTRUCTIONS =====
 
 PRIORITY ORDER:
 1. **TARGET JD is PRIMARY** - Evaluate CV match against target JD's requirements, skills, responsibilities
-2. **Similar JDs are SECONDARY** - Only use to identify additional skills that could strengthen the candidate
+2. **SKILL GAP ANALYSIS** - Use the skill gap data above to identify exact missing skills
+3. **KNOWLEDGE BASE** - Use the skill knowledge to provide accurate learning paths and CV tips
+4. **Similar JDs are SECONDARY** - Only use to identify additional skills that could strengthen the candidate
 
 TASK 1: Score each criterion from 0-100:
 1. SKILLS_SCORE: How well do the CV skills match the TARGET JD required skills? (Also note gaps from similar JDs)
